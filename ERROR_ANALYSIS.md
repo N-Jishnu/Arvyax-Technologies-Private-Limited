@@ -330,11 +330,3 @@ Error analysis was performed on held-out validation data (240 samples). We ident
 | Sarcasm | 1 | 10% |
 
 ---
-
-## Recommendations
-
-1. **Weighted Fusion**: Implement dynamic text/metadata weighting based on input quality
-2. **Keyword Boosting**: Add explicit emotion keywords with high weights
-3. **Pattern Detection**: Use "but/though/yet" patterns for contradiction detection
-4. **Confidence Calibration**: More aggressively lower confidence for short inputs
-5. **Label Smoothing**: Apply soft labels to reduce overfitting to noisy labels
