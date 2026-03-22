@@ -63,26 +63,14 @@ pip install -r requirements.txt
 
 ## Usage
 
-### Run the System (CLI)
 
-```bash
-python src/emotion_system.py
-```
-
-### Run the API
+### To Run the API
 
 ```bash
 python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Then:
-```bash
-curl -X POST http://localhost:8000/predict \
-  -H "Content-Type: application/json" \
-  -d '{"id":1,"journal_text":"i feel calm","energy_level":4,"stress_level":2}'
-```
-
-### Run the UI
+### To Run the UI
 
 ```bash
 streamlit run app.py
@@ -154,7 +142,7 @@ The `predictions.csv` contains:
 | Text-Only | 57.5% |
 | Improvement | +3.3% |
 
-The full model now outperforms text-only by 3.3%, demonstrating that metadata improves predictions.
+The full model outperforms text-only by 3.3%, demonstrating that metadata improves predictions.
 
 ---
 
@@ -255,7 +243,3 @@ For uncertain cases, the system defaults to safe actions: pause, box_breathing, 
 5. **Neutral Penalty**: Reduces over-prediction of neutral state
 
 ---
-
-## License
-
-Proprietary - Arvyax Technologies Private Limited
