@@ -59,7 +59,6 @@ class EmotionAwareSystem:
         
         positive_words = ['calm', 'peaceful', 'better', 'lighter', 'helpful', 'settled', 'clear', 'focused', 'ready', 'organized', 'ok', 'good', 'nice', 'able']
         negative_words = ['overwhelmed', 'exhausted', 'heavy', 'chaotic', 'scattered', 'unsettled', 'tense', 'anxious', 'tired', 'flooded', 'racing', 'stress']
-        neutral_words = ['ok', 'fine', 'normal', 'average', 'middle']
         
         pos_count = sum(1 for w in positive_words if w in text_lower)
         neg_count = sum(1 for w in negative_words if w in text_lower)
@@ -72,7 +71,10 @@ class EmotionAwareSystem:
         words = text_lower.split()
         complexity = np.log1p(len(words)) if words else 0
         
-        return [sentiment_score, has_but, has_and, complexity, len(words) / 100.0]
+        restless_keywords = ["jumping", "scattered", "racing", "switching", "distracted", "wandering", "fidgety"]
+        restless_flag = 1 if any(word in text_lower for word in restless_keywords) else 0
+        
+        return [sentiment_score, has_but, has_and, complexity, len(words) / 100.0, restless_flag]
     
     def _create_metadata_features(self, row):
         features = []
@@ -132,8 +134,25 @@ class EmotionAwareSystem:
             metadata_features.append(self._create_metadata_features(row))
         metadata_array = np.array(metadata_features)
         
-        combined = np.hstack([text_features.toarray(), sentiment_features, metadata_array])
+        text_dense = text_features.toarray()
         
+        weighted_features = []
+        for i, text in enumerate(df['journal_text']):
+            text_len = len(str(text)) if pd.notna(text) else 0
+            
+            if text_len < 20:
+                text_w, meta_w = 0.4, 0.6
+            else:
+                text_w, meta_w = 0.7, 0.3
+            
+            combined_row = np.hstack([
+                text_dense[i] * text_w,
+                sentiment_features[i] * text_w,
+                metadata_array[i] * meta_w
+            ])
+            weighted_features.append(combined_row)
+        
+        combined = np.array(weighted_features)
         combined = np.nan_to_num(combined, nan=0.0, posinf=1.0, neginf=-1.0)
         
         return combined
@@ -153,10 +172,14 @@ class EmotionAwareSystem:
         self.emotion_model.fit(X, y_emotion)
         
         print(f"Training intensity regressor...")
+        weights = np.ones(len(y_intensity))
+        weights[y_intensity == 1] *= 1.5
+        weights[y_intensity == 5] *= 1.5
+        
         self.intensity_model = GradientBoostingRegressor(
             n_estimators=150, max_depth=5, learning_rate=0.1, random_state=42
         )
-        self.intensity_model.fit(X, y_intensity)
+        self.intensity_model.fit(X, y_intensity, sample_weight=weights)
         
         print("Training complete!")
         
@@ -253,10 +276,16 @@ class EmotionAwareSystem:
                  w['w4'] * stress_score + 
                  w['w5'] * time_score)
         
-        return score
+        return score, {
+            "state_alignment": round(state_score, 2),
+            "intensity": round(intensity_score, 2),
+            "energy": round(energy_score, 2),
+            "stress": round(stress_score, 2),
+            "time": round(time_score, 2)
+        }
     
     def _decide_timing(self, intensity, stress, energy, time_of_day):
-        urgency = intensity + stress - energy
+        urgency = intensity * 1.2 + stress - energy
         
         if urgency >= 6:
             return 'now'
@@ -285,24 +314,32 @@ class EmotionAwareSystem:
         else:
             input_quality = 0.9
         
-        if pd.notna(stress_level) and pd.notna(energy_level):
+        sentiment_features = self._extract_sentiment_features(text)
+        sentiment_score = sentiment_features[0]
+        sentiment_norm = (sentiment_score + 1) / 2
+        
+        if pd.notna(stress_level):
             stress_val = float(stress_level)
-            energy_val = float(energy_level)
-            conflict = abs(stress_val - energy_val) / 5.0
+            meta_signal = stress_val / 5.0
         else:
-            conflict = 0.5
+            meta_signal = 0.5
+        
+        conflict = abs(sentiment_norm - meta_signal)
         
         confidence = 0.5 * model_conf + 0.3 * input_quality + 0.2 * (1 - conflict)
         
-        return np.clip(confidence, 0.1, 1.0)
+        return np.clip(confidence, 0.1, 1.0), conflict
     
-    def _check_uncertainty(self, confidence, text, row):
+    def _check_uncertainty(self, confidence, text, row, conflict):
         text_len = len(str(text)) if pd.notna(text) else 0
         
-        if confidence < 0.45:
+        if confidence < 0.5:
             return 1
         
         if text_len < 15:
+            return 1
+        
+        if conflict > 0.6:
             return 1
         
         missing_critical = (
@@ -322,7 +359,20 @@ class EmotionAwareSystem:
         predicted_states = self.emotion_encoder.inverse_transform(emotion_preds)
         
         predicted_intensity = self.intensity_model.predict(X)
-        predicted_intensity = np.clip(np.round(predicted_intensity), 1, 5)
+        
+        def calibrate_intensity(x):
+            if x < 1.8:
+                return 1
+            elif x < 2.6:
+                return 2
+            elif x < 3.4:
+                return 3
+            elif x < 4.2:
+                return 4
+            else:
+                return 5
+        
+        predicted_intensity = np.array([calibrate_intensity(x) for x in predicted_intensity])
         
         results = []
         
@@ -335,36 +385,66 @@ class EmotionAwareSystem:
             time_of_day = str(row.get('time_of_day', 'morning')).lower() if pd.notna(row.get('time_of_day')) else 'morning'
             
             proba = emotion_proba[i] if i < len(emotion_proba) else None
-            confidence = self._compute_confidence(
+            journal_text = row.get('journal_text', '')
+            confidence, conflict = self._compute_confidence(
                 proba, 
-                row.get('journal_text', ''),
+                journal_text,
                 stress, energy
             )
             
+            if proba is not None:
+                proba = proba.copy()
+                neutral_idx = list(self.emotion_encoder.classes_).index("neutral")
+                
+                if proba[neutral_idx] > 0.4:
+                    proba[neutral_idx] *= 0.85
+                
+                state = self.emotion_encoder.inverse_transform([np.argmax(proba)])[0]
+            
+            restless_keywords = ["jumping", "scattered", "racing", "switching", "distracted", "wandering", "fidgety"]
+            text_lower = str(journal_text).lower()
+            if any(word in text_lower for word in restless_keywords):
+                state = "restless"
+                confidence = max(confidence, 0.6)
+            
             uncertain_flag = self._check_uncertainty(
-                confidence, row.get('journal_text', ''), row
+                confidence, journal_text, row, conflict
             )
             
             if uncertain_flag:
-                state = 'neutral'
+                state = "mixed" if conflict > 0.5 else "neutral"
                 intensity = 3
             
+            action_usage_penalty = {
+                "rest": 1.3,
+                "box_breathing": 1.2,
+                "yoga": 1.1
+            }
+            
             action_scores = {}
+            action_reasons = {}
             for action in self.ACTIONS:
-                score = self._score_action(action, state, intensity, energy, stress, time_of_day)
+                score, reason = self._score_action(action, state, intensity, energy, stress, time_of_day)
+                score *= action_usage_penalty.get(action, 1.0)
                 action_scores[action] = score
+                action_reasons[action] = reason
             
             what_to_do = max(action_scores, key=action_scores.get)
+            decision_reason = action_reasons[what_to_do]
             when_to_do = self._decide_timing(intensity, stress, energy, time_of_day)
             
             if uncertain_flag:
                 safe_actions = ['pause', 'box_breathing', 'light_planning']
                 scores = {a: action_scores.get(a, 0) for a in safe_actions}
                 what_to_do = max(scores, key=scores.get)
+                decision_reason = action_reasons[what_to_do]
             
             supportive_message = self._generate_supportive_message(
                 state, int(intensity), what_to_do, when_to_do, confidence, uncertain_flag
             )
+            
+            text_len = len(str(journal_text)) if pd.notna(journal_text) else 0
+            confidence_reason = self._confidence_reason(confidence, text_len, conflict)
             
             results.append({
                 'id': row.get('id', i),
@@ -374,6 +454,8 @@ class EmotionAwareSystem:
                 'uncertain_flag': uncertain_flag,
                 'what_to_do': what_to_do,
                 'when_to_do': when_to_do,
+                'decision_reason': decision_reason,
+                'confidence_reason': confidence_reason,
                 'supportive_message': supportive_message
             })
         
@@ -389,7 +471,20 @@ class EmotionAwareSystem:
         predicted_states = self.emotion_encoder.inverse_transform(emotion_preds)
         
         predicted_intensity = self.intensity_model.predict(X)
-        predicted_intensity = np.clip(np.round(predicted_intensity), 1, 5)
+        
+        def calibrate_intensity(x):
+            if x < 1.8:
+                return 1
+            elif x < 2.6:
+                return 2
+            elif x < 3.4:
+                return 3
+            elif x < 4.2:
+                return 4
+            else:
+                return 5
+        
+        predicted_intensity = np.array([calibrate_intensity(x) for x in predicted_intensity])
         
         emotion_acc = accuracy_score(y_true_emotion, predicted_states)
         intensity_rmse = np.sqrt(mean_squared_error(y_true_intensity, predicted_intensity))
@@ -432,6 +527,40 @@ class EmotionAwareSystem:
         print(f"Difference: {(full_acc - text_only_acc)*100:.1f}%")
         
         return {'full': full_acc, 'text_only': text_only_acc}
+    
+    def _confidence_reason(self, confidence, text_len, conflict):
+        reasons = []
+        
+        if text_len < 20:
+            reasons.append("short input")
+        if conflict > 0.5:
+            reasons.append("conflicting signals")
+        if confidence < 0.5:
+            reasons.append("low model certainty")
+        
+        return ", ".join(reasons) if reasons else "high confidence"
+    
+    def show_feature_importance(self, top_n=20):
+        importances = self.emotion_model.feature_importances_
+        
+        text_features = list(self.text_vectorizer.get_feature_names_out())
+        extra_features = [
+            "sentiment", "has_but", "has_and", "complexity", "length", "restless_flag",
+            "energy", "stress", "sleep", "duration", "time_of_day",
+            "previous_mood", "reflection_quality", "face_emotion", "low_sleep_flag"
+        ]
+        
+        feature_names = text_features + extra_features
+        
+        indices = np.argsort(importances)[::-1][:top_n]
+        
+        print(f"\nTop {top_n} Feature Importances:")
+        for i, idx in enumerate(indices):
+            if idx < len(feature_names):
+                name = feature_names[idx]
+            else:
+                name = f"feature_{idx}"
+            print(f"  {i+1}. {name}: {importances[idx]:.4f}")
     
     def _generate_supportive_message(self, state, intensity, action, when_to_do, confidence, uncertain_flag):
         """Generate human-like supportive message based on prediction"""
@@ -543,8 +672,8 @@ class EmotionAwareSystem:
 
 def main():
     print("Loading data...")
-    train_df = pd.read_csv('data\Sample_arvyax_reflective_training.csv')
-    test_df = pd.read_csv('data\Arvyax_test_inputs.csv')
+    train_df = pd.read_csv('data/Sample_arvyax_reflective_training.csv')
+    test_df = pd.read_csv('data/Arvyax_test_inputs.csv')
     
     print(f"Training samples: {len(train_df)}")
     print(f"Test samples: {len(test_df)}")
@@ -554,10 +683,13 @@ def main():
     print("EMOTION-AWARE DECISION SYSTEM")
     print("="*50)
     
-    system = EmotionAwareSystem(use_transformer=False)
+    system = EmotionAwareSystem()
     
     print("\n--- Training Phase ---")
     system.fit(train_df)
+    
+    print("\n--- Feature Importance ---")
+    system.show_feature_importance(top_n=15)
     
     print("\n--- Evaluation on Held-Out Data ---")
     train_split, eval_split = train_test_split(train_df, test_size=0.2, random_state=42)
@@ -589,6 +721,10 @@ def main():
     print("\n--- Sample Supportive Messages ---")
     for i in range(3):
         print(f"\n  ID {predictions.iloc[i]['id']}: {predictions.iloc[i]['supportive_message'][:80]}...")
+    
+    print("\n--- Sample Decision Reasons ---")
+    for i in range(3):
+        print(f"\n  ID {predictions.iloc[i]['id']}: {predictions.iloc[i]['decision_reason']}")
     
     predictions.to_csv('predictions.csv', index=False)
     print("\nPredictions saved to predictions.csv")
